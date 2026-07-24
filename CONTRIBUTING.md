@@ -10,6 +10,12 @@ The layer is a self-contained external Lambda extension that:
 
 It does not import, patch, or package the Braintrust SDK; it operates at the SDK's HTTP boundary, matching the Braintrust Python SDK 0.27.x.
 
+### Authentication and sessions
+
+The extension has no API key of its own. It uses the `Authorization: Bearer` token from each inbound request, falling back to `BRAINTRUST_API_KEY` if set, so the credential the SDK already holds is the one used upstream. Nothing sensitive needs to be in the function configuration, and the key is kept in memory only: never written to the spool or logged.
+
+The expected setup is a single credential per execution environment but multiple keys work safely. On first use of a key, the extension logs in once and caches the session (the org's login response and its resolved data-plane URL), keyed by that key. Each spooled payload is bound to the key that accepted it and delivered to that key's data plane.
+
 ## Prerequisites
 
 - Docker — used to produce the statically linked, Amazon Linux-compatible binary.

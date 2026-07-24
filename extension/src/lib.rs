@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Write};
@@ -23,7 +23,7 @@ const DEFAULT_MAX_PAYLOAD_BYTES: usize = 6 * 1024 * 1024;
 struct Settings {
     port: u16,
     spool_dir: PathBuf,
-    api_key: String,
+    api_key: Option<String>,
     app_url: String,
     api_url: Option<String>,
     org_name: Option<String>,
@@ -40,10 +40,8 @@ struct Settings {
 impl Settings {
     fn from_env() -> Result<Self> {
         let api_key = env::var("BRAINTRUST_API_KEY")
-            .context("BRAINTRUST_API_KEY is required by the Braintrust Lambda extension")?;
-        if api_key.is_empty() {
-            bail!("BRAINTRUST_API_KEY is required by the Braintrust Lambda extension");
-        }
+            .ok()
+            .filter(|value| !value.is_empty());
 
         let configured_api_url = env::var("BRAINTRUST_API_URL").ok();
         let api_url = env::var("BRAINTRUST_LAMBDA_UPSTREAM_URL")
@@ -129,16 +127,24 @@ fn join_url(base_url: &str, path: &str) -> Result<Url> {
 struct Spool {
     directory: PathBuf,
     fsync: bool,
+    // In-memory only (never persisted): the bearer token that accepted each spooled
+    // payload, so a retry delivers with the credential that accepted it rather than
+    // whatever token was captured most recently.
+    tokens: Mutex<HashMap<PathBuf, String>>,
 }
 
 impl Spool {
     fn new(directory: PathBuf, fsync: bool) -> Result<Self> {
         fs::create_dir_all(&directory)
             .with_context(|| format!("failed to create spool directory {}", directory.display()))?;
-        Ok(Self { directory, fsync })
+        Ok(Self {
+            directory,
+            fsync,
+            tokens: Mutex::new(HashMap::new()),
+        })
     }
 
-    fn enqueue(&self, body: &[u8]) -> Result<PathBuf> {
+    fn enqueue(&self, body: &[u8], token: Option<&str>) -> Result<PathBuf> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -161,6 +167,12 @@ impl Spool {
                 destination.display()
             )
         })?;
+        if let Some(token) = token {
+            self.tokens
+                .lock()
+                .unwrap()
+                .insert(destination.clone(), token.to_string());
+        }
         Ok(destination)
     }
 
@@ -176,7 +188,20 @@ impl Spool {
         Ok(entries)
     }
 
+    // Pending payloads paired with the token that accepted them. Entries with no known
+    // token (e.g. left by a previous process) are omitted so they are never delivered
+    // with a different credential.
+    fn deliverable(&self) -> Result<Vec<(PathBuf, String)>> {
+        let pending = self.pending()?;
+        let tokens = self.tokens.lock().unwrap();
+        Ok(pending
+            .into_iter()
+            .filter_map(|path| tokens.get(&path).map(|token| (path, token.clone())))
+            .collect())
+    }
+
     fn delete(&self, path: &Path) -> Result<()> {
+        self.tokens.lock().unwrap().remove(path);
         match fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -185,13 +210,54 @@ impl Spool {
     }
 }
 
-struct LoginDiscovery {
+// A logged-in Braintrust session for one API key: the login response plus the
+// data-plane URL resolved for that key's org. Cached per key so multi-key setups
+// (e.g. separate qa/staging keys in one function) never cross-deliver.
+struct Session {
+    login_response: Value,
+    api_url: String,
+}
+
+fn select_org(response: &Value, org_name: Option<&str>) -> Result<Value> {
+    let orgs = response
+        .get("org_info")
+        .and_then(Value::as_array)
+        .context("Braintrust login returned invalid organization metadata")?;
+    if let Some(org_name) = org_name {
+        return orgs
+            .iter()
+            .find(|org| org.get("name").and_then(Value::as_str) == Some(org_name))
+            .cloned()
+            .with_context(|| format!("Braintrust organization {org_name:?} was not found"));
+    }
+    orgs.first()
+        .cloned()
+        .context("Braintrust login returned no organizations")
+}
+
+// The session's login response with every org's data-plane URL rewritten to the
+// local extension, so the SDK keeps talking to us instead of the real data plane.
+fn local_login_response(session: &Session, local_url: &str) -> Result<Value> {
+    let mut response = session.login_response.clone();
+    let orgs = response
+        .get_mut("org_info")
+        .and_then(Value::as_array_mut)
+        .context("Braintrust login returned invalid organization metadata")?;
+    for org in orgs {
+        org.as_object_mut()
+            .context("Braintrust login returned invalid organization metadata")?
+            .insert("api_url".to_string(), Value::String(local_url.to_string()));
+    }
+    Ok(response)
+}
+
+struct SessionStore {
     settings: Arc<Settings>,
-    response: Mutex<Option<Value>>,
+    sessions: Mutex<HashMap<String, Arc<Session>>>,
     client: Client,
 }
 
-impl LoginDiscovery {
+impl SessionStore {
     fn new(settings: Arc<Settings>) -> Result<Self> {
         let client = Client::builder()
             .timeout(settings.request_timeout)
@@ -199,27 +265,31 @@ impl LoginDiscovery {
             .build()?;
         Ok(Self {
             settings,
-            response: Mutex::new(None),
+            sessions: Mutex::new(HashMap::new()),
             client,
         })
     }
 
-    fn response(&self) -> Result<Value> {
-        let mut cached = self.response.lock().unwrap();
-        if let Some(response) = cached.as_ref() {
-            return Ok(response.clone());
+    // Return the session for a token, logging in once per key on first use. The login
+    // runs outside the lock so one key's login never blocks lookups for another.
+    fn get_or_create(&self, token: &str) -> Result<Arc<Session>> {
+        if let Some(session) = self.sessions.lock().unwrap().get(token) {
+            return Ok(Arc::clone(session));
         }
-        let response = self.fetch()?;
-        *cached = Some(response.clone());
-        Ok(response)
+        let session = Arc::new(self.login(token)?);
+        let mut sessions = self.sessions.lock().unwrap();
+        let entry = sessions
+            .entry(token.to_string())
+            .or_insert_with(|| Arc::clone(&session));
+        Ok(Arc::clone(entry))
     }
 
-    fn fetch(&self) -> Result<Value> {
+    fn login(&self, token: &str) -> Result<Session> {
         let url = join_url(&self.settings.app_url, "/api/apikey/login")?;
         let response = self
             .client
             .post(url)
-            .bearer_auth(&self.settings.api_key)
+            .bearer_auth(token)
             .header(CONTENT_TYPE, "application/json")
             .body(Vec::new())
             .send()?
@@ -233,56 +303,27 @@ impl LoginDiscovery {
         if orgs.iter().any(|org| !org.is_object()) {
             bail!("Braintrust login returned invalid organization metadata");
         }
-        Ok(response)
+        let api_url = match &self.settings.api_url {
+            Some(api_url) => api_url.clone(),
+            None => select_org(&response, self.settings.org_name.as_deref())?
+                .get("api_url")
+                .and_then(Value::as_str)
+                .filter(|url| !url.is_empty())
+                .map(str::to_owned)
+                .context("Braintrust login returned an invalid data-plane URL")?,
+        };
+        Ok(Session {
+            login_response: response,
+            api_url,
+        })
     }
 
-    fn selected_org(&self) -> Result<Value> {
-        let response = self.response()?;
-        let orgs = response
-            .get("org_info")
-            .and_then(Value::as_array)
-            .context("Braintrust login returned invalid organization metadata")?;
-        if let Some(org_name) = self.settings.org_name.as_deref() {
-            return orgs
-                .iter()
-                .find(|org| org.get("name").and_then(Value::as_str) == Some(org_name))
-                .cloned()
-                .with_context(|| format!("Braintrust organization {org_name:?} was not found"));
-        }
-        orgs.first()
-            .cloned()
-            .context("Braintrust login returned no organizations")
-    }
-
-    fn api_url(&self) -> Result<String> {
-        self.selected_org()?
-            .get("api_url")
-            .and_then(Value::as_str)
-            .filter(|url| !url.is_empty())
-            .map(str::to_owned)
-            .context("Braintrust login returned an invalid data-plane URL")
-    }
-
-    fn local_response(&self, local_url: &str) -> Result<Value> {
-        let mut response = self.response()?;
-        let orgs = response
-            .get_mut("org_info")
-            .and_then(Value::as_array_mut)
-            .context("Braintrust login returned invalid organization metadata")?;
-        for org in orgs {
-            org.as_object_mut()
-                .context("Braintrust login returned invalid organization metadata")?
-                .insert("api_url".to_string(), Value::String(local_url.to_string()));
-        }
-        Ok(response)
-    }
-
-    fn prefetch(self: &Arc<Self>) -> Result<()> {
-        let discovery = Arc::clone(self);
+    fn prefetch(self: &Arc<Self>, token: String) -> Result<()> {
+        let store = Arc::clone(self);
         thread::Builder::new()
             .name("braintrust-login".to_string())
             .spawn(move || {
-                if let Err(error) = discovery.response() {
+                if let Err(error) = store.get_or_create(&token) {
                     eprintln!("Braintrust Lambda login prefetch failed: {error:#}");
                 }
             })
@@ -292,47 +333,31 @@ impl LoginDiscovery {
 }
 
 trait LogSender: Send + Sync {
-    fn send(&self, body: &[u8]) -> Result<()>;
+    fn send(&self, body: &[u8], token: &str) -> Result<()>;
 }
 
 struct UpstreamSender {
-    settings: Arc<Settings>,
-    discovery: Arc<LoginDiscovery>,
-    api_url: Mutex<Option<String>>,
+    sessions: Arc<SessionStore>,
     client: Client,
 }
 
 impl UpstreamSender {
-    fn new(settings: Arc<Settings>, discovery: Arc<LoginDiscovery>) -> Result<Self> {
+    fn new(settings: Arc<Settings>, sessions: Arc<SessionStore>) -> Result<Self> {
         let client = Client::builder()
             .timeout(settings.request_timeout)
             .user_agent(EXTENSION_NAME)
             .build()?;
-        Ok(Self {
-            api_url: Mutex::new(settings.api_url.clone()),
-            settings,
-            discovery,
-            client,
-        })
-    }
-
-    fn api_url(&self) -> Result<String> {
-        let mut api_url = self.api_url.lock().unwrap();
-        if let Some(api_url) = api_url.as_ref() {
-            return Ok(api_url.clone());
-        }
-        let discovered = self.discovery.api_url()?;
-        *api_url = Some(discovered.clone());
-        Ok(discovered)
+        Ok(Self { sessions, client })
     }
 }
 
 impl LogSender for UpstreamSender {
-    fn send(&self, body: &[u8]) -> Result<()> {
-        let url = join_url(&self.api_url()?, "/logs3")?;
+    fn send(&self, body: &[u8], token: &str) -> Result<()> {
+        let session = self.sessions.get_or_create(token)?;
+        let url = join_url(&session.api_url, "/logs3")?;
         self.client
             .post(url)
-            .bearer_auth(&self.settings.api_key)
+            .bearer_auth(token)
             .header(CONTENT_TYPE, "application/json")
             .body(body.to_vec())
             .send()?
@@ -396,8 +421,8 @@ impl DeliveryWorker {
         loop {
             let has_pending = self
                 .spool
-                .pending()
-                .map(|pending| !pending.is_empty())
+                .deliverable()
+                .map(|entries| !entries.is_empty())
                 .unwrap_or(true);
             if !state.in_flight && !has_pending {
                 return true;
@@ -429,8 +454,8 @@ impl DeliveryWorker {
             if self.state.lock().unwrap().stopping {
                 return;
             }
-            let pending = match self.spool.pending() {
-                Ok(pending) => pending,
+            let next = match self.spool.deliverable() {
+                Ok(entries) => entries.into_iter().next(),
                 Err(error) => {
                     eprintln!("Braintrust Lambda spool scan failed: {error:#}");
                     if self.wait_for_retry(retry) {
@@ -440,14 +465,14 @@ impl DeliveryWorker {
                     continue;
                 }
             };
-            let Some(path) = pending.first() else {
+            let Some((path, token)) = next else {
                 let mut state = self.state.lock().unwrap();
-                let still_empty = self
+                let still_pending = self
                     .spool
-                    .pending()
-                    .map(|pending| pending.is_empty())
+                    .deliverable()
+                    .map(|entries| !entries.is_empty())
                     .unwrap_or(false);
-                if !still_empty {
+                if still_pending {
                     continue;
                 }
                 state.in_flight = false;
@@ -464,10 +489,10 @@ impl DeliveryWorker {
                 let mut state = self.state.lock().unwrap();
                 state.in_flight = true;
             }
-            let result = fs::read(path)
+            let result = fs::read(&path)
                 .with_context(|| format!("failed to read spool file {}", path.display()))
-                .and_then(|body| self.sender.send(&body))
-                .and_then(|()| self.spool.delete(path));
+                .and_then(|body| self.sender.send(&body, &token))
+                .and_then(|()| self.spool.delete(&path));
             match result {
                 Ok(()) => retry = self.retry_base,
                 Err(error) => {
@@ -556,7 +581,7 @@ struct LocalService {
     spool: Arc<Spool>,
     worker: Arc<DeliveryWorker>,
     runtime_done: Arc<RuntimeDoneTracker>,
-    discovery: Arc<LoginDiscovery>,
+    sessions: Arc<SessionStore>,
     bound_port: AtomicU16,
 }
 
@@ -569,8 +594,8 @@ impl LocalService {
         format!("http://127.0.0.1:{port}")
     }
 
-    fn accept_logs(&self, body: &[u8]) -> Result<()> {
-        self.spool.enqueue(body)?;
+    fn accept_logs(&self, body: &[u8], token: &str) -> Result<()> {
+        self.spool.enqueue(body, Some(token))?;
         self.worker.notify();
         Ok(())
     }
@@ -598,6 +623,7 @@ type HttpResponse = Response<Cursor<Vec<u8>>>;
 
 enum HttpFailure {
     BadRequest(String),
+    Unauthorized(String),
     Internal(anyhow::Error),
 }
 
@@ -634,6 +660,22 @@ fn read_body(request: &mut Request, max_bytes: usize) -> std::result::Result<Vec
     Ok(body)
 }
 
+fn captured_bearer(request: &Request) -> Option<String> {
+    request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv("Authorization"))
+        .and_then(|header| {
+            let value = header.value.as_str();
+            value
+                .strip_prefix("Bearer ")
+                .or_else(|| value.strip_prefix("bearer "))
+        })
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+}
+
 fn route_request(
     request: &mut Request,
     service: &LocalService,
@@ -642,6 +684,8 @@ fn route_request(
         .map_err(|error| HttpFailure::BadRequest(error.to_string()))?;
     let path = parsed_url.path();
     let method = request.method().clone();
+
+    let token = captured_bearer(request).or_else(|| service.settings.api_key.clone());
 
     if method == Method::Get && path == "/health" {
         return Ok(json_response(200, json!({"status": "ok"})));
@@ -666,10 +710,18 @@ fn route_request(
     }
     if method == Method::Post && path == "/api/apikey/login" {
         read_body(request, service.settings.max_payload_bytes)?;
-        let response = service
-            .discovery
-            .local_response(&service.local_url())
+        let token = token.as_deref().ok_or_else(|| {
+            HttpFailure::Unauthorized(
+                "no Braintrust API key available: send the SDK's Authorization header or set BRAINTRUST_API_KEY"
+                    .to_string(),
+            )
+        })?;
+        let session = service
+            .sessions
+            .get_or_create(token)
             .map_err(HttpFailure::Internal)?;
+        let response =
+            local_login_response(&session, &service.local_url()).map_err(HttpFailure::Internal)?;
         return Ok(json_response(200, response));
     }
     if method == Method::Post && path == "/api/project/register" {
@@ -697,7 +749,15 @@ fn route_request(
     }
     if method == Method::Post && path == "/logs3" {
         let body = read_body(request, service.settings.max_payload_bytes)?;
-        service.accept_logs(&body).map_err(HttpFailure::Internal)?;
+        let token = token.as_deref().ok_or_else(|| {
+            HttpFailure::Unauthorized(
+                "no Braintrust API key available: send the SDK's Authorization header or set BRAINTRUST_API_KEY"
+                    .to_string(),
+            )
+        })?;
+        service
+            .accept_logs(&body, token)
+            .map_err(HttpFailure::Internal)?;
         return Ok(json_response(200, json!({"ids": [], "xact_id": null})));
     }
     if method == Method::Post && path == "/telemetry" {
@@ -714,6 +774,10 @@ fn handle_request(mut request: Request, service: &LocalService) {
     let response = match route_request(&mut request, service) {
         Ok(response) => response,
         Err(HttpFailure::BadRequest(message)) => json_response(400, json!({"error": message})),
+        Err(HttpFailure::Unauthorized(message)) => {
+            eprintln!("Braintrust Lambda extension: {message}");
+            json_response(401, json!({"error": message}))
+        }
         Err(HttpFailure::Internal(error)) => {
             eprintln!("Braintrust Lambda local intake failed: {error:#}");
             json_response(500, json!({"error": "local intake failed"}))
@@ -873,11 +937,18 @@ fn remaining(deadline_ms: Option<f64>) -> Duration {
 
 pub fn run() -> Result<()> {
     let settings = Arc::new(Settings::from_env()?);
+    if settings.api_key.is_some() {
+        eprintln!("Braintrust Lambda extension: using BRAINTRUST_API_KEY from the environment");
+    } else {
+        eprintln!(
+            "Braintrust Lambda extension: no BRAINTRUST_API_KEY set; using the API key from inbound SDK requests"
+        );
+    }
     let spool = Arc::new(Spool::new(settings.spool_dir.clone(), settings.fsync)?);
-    let discovery = Arc::new(LoginDiscovery::new(Arc::clone(&settings))?);
+    let sessions = Arc::new(SessionStore::new(Arc::clone(&settings))?);
     let sender = Arc::new(UpstreamSender::new(
         Arc::clone(&settings),
-        Arc::clone(&discovery),
+        Arc::clone(&sessions),
     )?);
     let worker = DeliveryWorker::new(
         Arc::clone(&spool),
@@ -891,11 +962,13 @@ pub fn run() -> Result<()> {
         spool,
         worker: Arc::clone(&worker),
         runtime_done: Arc::clone(&runtime_done),
-        discovery: Arc::clone(&discovery),
+        sessions: Arc::clone(&sessions),
         bound_port: AtomicU16::new(0),
     });
     let local_server = LocalServer::start(service)?;
-    discovery.prefetch()?;
+    if let Some(api_key) = settings.api_key.clone() {
+        sessions.prefetch(api_key)?;
+    }
     let worker_runner = worker.start()?;
 
     let runtime_api = env::var("AWS_LAMBDA_RUNTIME_API")
@@ -936,12 +1009,30 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingSender {
-        bodies: Mutex<Vec<Vec<u8>>>,
+        sent: Mutex<Vec<(Vec<u8>, String)>>,
+        fail_first: Mutex<usize>,
+    }
+
+    impl RecordingSender {
+        fn failing(attempts: usize) -> Self {
+            Self {
+                sent: Mutex::new(Vec::new()),
+                fail_first: Mutex::new(attempts),
+            }
+        }
     }
 
     impl LogSender for RecordingSender {
-        fn send(&self, body: &[u8]) -> Result<()> {
-            self.bodies.lock().unwrap().push(body.to_vec());
+        fn send(&self, body: &[u8], token: &str) -> Result<()> {
+            self.sent
+                .lock()
+                .unwrap()
+                .push((body.to_vec(), token.to_string()));
+            let mut fail_first = self.fail_first.lock().unwrap();
+            if *fail_first > 0 {
+                *fail_first -= 1;
+                bail!("simulated upstream failure");
+            }
             Ok(())
         }
     }
@@ -950,7 +1041,7 @@ mod tests {
         Arc::new(Settings {
             port: 0,
             spool_dir: temp_dir.path().to_path_buf(),
-            api_key: "test-api-key".to_string(),
+            api_key: Some("test-api-key".to_string()),
             app_url: "http://unused.invalid".to_string(),
             api_url: Some("http://unused.invalid".to_string()),
             org_name: None,
@@ -970,7 +1061,7 @@ mod tests {
         sender: Arc<dyn LogSender>,
     ) -> Result<(Arc<LocalService>, WorkerRunner)> {
         let spool = Arc::new(Spool::new(settings.spool_dir.clone(), settings.fsync)?);
-        let discovery = Arc::new(LoginDiscovery::new(Arc::clone(&settings))?);
+        let sessions = Arc::new(SessionStore::new(Arc::clone(&settings))?);
         let worker = DeliveryWorker::new(
             Arc::clone(&spool),
             sender,
@@ -984,7 +1075,7 @@ mod tests {
                 spool,
                 worker,
                 runtime_done: Arc::new(RuntimeDoneTracker::default()),
-                discovery,
+                sessions,
                 bound_port: AtomicU16::new(0),
             }),
             runner,
@@ -1054,7 +1145,10 @@ mod tests {
 
         assert_eq!(response.status(), 200);
         assert!(service.worker.wait_until_idle(Duration::from_secs(1)));
-        assert_eq!(*sender.bodies.lock().unwrap(), vec![payload.to_vec()]);
+        let sent = sender.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, payload.to_vec());
+        assert_eq!(sent[0].1, "test-api-key");
         assert!(service.spool.pending()?.is_empty());
         Ok(())
     }
@@ -1109,11 +1203,11 @@ mod tests {
         settings.api_url = None;
         settings.org_name = Some("example-org".to_string());
         let settings = Arc::new(settings);
-        let discovery = Arc::new(LoginDiscovery::new(Arc::clone(&settings))?);
-        let sender = UpstreamSender::new(settings, discovery)?;
+        let sessions = Arc::new(SessionStore::new(Arc::clone(&settings))?);
+        let sender = UpstreamSender::new(settings, sessions)?;
         let payload = br#"{"rows":[],"api_version":2}"#;
 
-        sender.send(payload)?;
+        sender.send(payload, "test-api-key")?;
 
         let requests = requests.iter().take(2).collect::<Vec<_>>();
         assert_eq!(
@@ -1248,6 +1342,221 @@ mod tests {
         thread
             .join()
             .map_err(|_| anyhow!("Lambda API server thread panicked"))??;
+        Ok(())
+    }
+
+    #[test]
+    fn each_payload_delivered_with_its_own_token() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let mut settings = (*settings(&temp_dir)).clone();
+        settings.api_key = None;
+        let sender = Arc::new(RecordingSender::default());
+        let (service, _runner) = service(Arc::new(settings), sender.clone())?;
+        let server = LocalServer::start(Arc::clone(&service))?;
+        let base = format!("http://127.0.0.1:{}", server.port);
+        let client = Client::new();
+
+        client
+            .post(format!("{base}/logs3"))
+            .bearer_auth("key-a")
+            .body(b"payload-a".to_vec())
+            .send()?
+            .error_for_status()?;
+        client
+            .post(format!("{base}/logs3"))
+            .bearer_auth("key-b")
+            .body(b"payload-b".to_vec())
+            .send()?
+            .error_for_status()?;
+
+        assert!(service.worker.wait_until_idle(Duration::from_secs(2)));
+        let by_body: std::collections::HashMap<Vec<u8>, String> =
+            sender.sent.lock().unwrap().iter().cloned().collect();
+        assert_eq!(
+            by_body.get(b"payload-a".as_slice()).map(String::as_str),
+            Some("key-a")
+        );
+        assert_eq!(
+            by_body.get(b"payload-b".as_slice()).map(String::as_str),
+            Some("key-b")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retry_uses_the_token_that_accepted_the_payload() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let mut settings = (*settings(&temp_dir)).clone();
+        settings.api_key = None;
+        let sender = Arc::new(RecordingSender::failing(1));
+        let (service, _runner) = service(Arc::new(settings), sender.clone())?;
+        let server = LocalServer::start(Arc::clone(&service))?;
+        let base = format!("http://127.0.0.1:{}", server.port);
+        let client = Client::new();
+
+        client
+            .post(format!("{base}/logs3"))
+            .bearer_auth("key-a")
+            .body(b"payload-a".to_vec())
+            .send()?
+            .error_for_status()?;
+
+        assert!(service.worker.wait_until_idle(Duration::from_secs(2)));
+        let sent = sender.sent.lock().unwrap();
+        assert!(
+            sent.len() >= 2,
+            "expected a retry, got {} attempt(s)",
+            sent.len()
+        );
+        assert!(
+            sent.iter().all(|(_, token)| token == "key-a"),
+            "every delivery attempt must use the accepting token; got {sent:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn captured_token_is_never_written_to_the_spooled_body() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let mut settings = (*settings(&temp_dir)).clone();
+        settings.api_key = None;
+        let sender = Arc::new(RecordingSender::default());
+        let (service, _runner) = service(Arc::new(settings), sender.clone())?;
+        let server = LocalServer::start(Arc::clone(&service))?;
+        let payload = br#"{"rows":[],"api_version":2}"#;
+
+        Client::new()
+            .post(format!("http://127.0.0.1:{}/logs3", server.port))
+            .bearer_auth("super-secret-key")
+            .body(payload.to_vec())
+            .send()?
+            .error_for_status()?;
+
+        assert!(service.worker.wait_until_idle(Duration::from_secs(1)));
+        let delivered = sender.sent.lock().unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].0, payload.to_vec());
+        assert_eq!(delivered[0].1, "super-secret-key");
+        assert!(!String::from_utf8_lossy(&delivered[0].0).contains("super-secret-key"));
+        Ok(())
+    }
+
+    #[test]
+    fn login_facade_without_token_fails_cleanly() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let mut settings = (*settings(&temp_dir)).clone();
+        settings.api_key = None;
+        let (service, _runner) = service(Arc::new(settings), Arc::new(RecordingSender::default()))?;
+        let server = LocalServer::start(Arc::clone(&service))?;
+        let client = Client::new();
+        let base = format!("http://127.0.0.1:{}", server.port);
+
+        let response = client
+            .post(format!("{base}/api/apikey/login"))
+            .body(Vec::new())
+            .send()?;
+        assert_eq!(response.status(), 401);
+
+        // Server stays healthy after rejecting the credential-less login.
+        let health = client.get(format!("{base}/health")).send()?;
+        assert_eq!(health.status(), 200);
+        Ok(())
+    }
+
+    #[test]
+    fn spool_binds_token_per_payload() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let spool = Spool::new(temp_dir.path().to_path_buf(), false)?;
+        let a = spool.enqueue(b"payload-a", Some("key-a"))?;
+        let b = spool.enqueue(b"payload-b", Some("key-b"))?;
+
+        let deliverable: std::collections::HashMap<_, _> =
+            spool.deliverable()?.into_iter().collect();
+        assert_eq!(deliverable.get(&a).map(String::as_str), Some("key-a"));
+        assert_eq!(deliverable.get(&b).map(String::as_str), Some("key-b"));
+
+        spool.delete(&a)?;
+        assert_eq!(spool.deliverable()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn unbound_spool_entry_is_not_deliverable() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let spool = Spool::new(temp_dir.path().to_path_buf(), false)?;
+        std::fs::write(temp_dir.path().join("0-orphan.json"), b"orphan")?;
+        assert_eq!(spool.pending()?.len(), 1);
+        assert!(spool.deliverable()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn logs3_without_token_is_rejected() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let mut settings = (*settings(&temp_dir)).clone();
+        settings.api_key = None;
+        let (service, _runner) = service(Arc::new(settings), Arc::new(RecordingSender::default()))?;
+        let server = LocalServer::start(Arc::clone(&service))?;
+
+        let response = Client::new()
+            .post(format!("http://127.0.0.1:{}/logs3", server.port))
+            .body(b"{}".to_vec())
+            .send()?;
+        assert_eq!(response.status(), 401);
+        assert!(service.spool.pending()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn sessions_resolve_api_url_per_key() -> Result<()> {
+        let server = Server::http("127.0.0.1:0")
+            .map_err(|error| anyhow!("failed to start login server: {error}"))?;
+        let port = server
+            .server_addr()
+            .to_ip()
+            .context("login server did not bind an IP socket")?
+            .port();
+        let thread = thread::spawn(move || -> Result<()> {
+            for _ in 0..2 {
+                let mut request = server
+                    .recv_timeout(Duration::from_secs(2))?
+                    .context("timed out waiting for login")?;
+                let token = request
+                    .headers()
+                    .iter()
+                    .find(|header| header.field.equiv("Authorization"))
+                    .map(|header| header.value.as_str().to_string())
+                    .unwrap_or_default();
+                let api_url = if token == "Bearer key-a" {
+                    "https://a.example"
+                } else {
+                    "https://b.example"
+                };
+                let mut body = Vec::new();
+                request.as_reader().read_to_end(&mut body)?;
+                request.respond(json_response(
+                    200,
+                    json!({"org_info": [{"id": "org", "name": "example-org", "api_url": api_url}]}),
+                ))?;
+            }
+            Ok(())
+        });
+
+        let temp_dir = TempDir::new()?;
+        let mut settings = (*settings(&temp_dir)).clone();
+        settings.app_url = format!("http://127.0.0.1:{port}");
+        settings.api_url = None;
+        settings.org_name = Some("example-org".to_string());
+        let store = SessionStore::new(Arc::new(settings))?;
+
+        assert_eq!(store.get_or_create("key-a")?.api_url, "https://a.example");
+        assert_eq!(store.get_or_create("key-b")?.api_url, "https://b.example");
+        // Cached: a repeat lookup does not trigger another login (server served only 2).
+        assert_eq!(store.get_or_create("key-a")?.api_url, "https://a.example");
+
+        thread
+            .join()
+            .map_err(|_| anyhow!("login server thread panicked"))??;
         Ok(())
     }
 }
