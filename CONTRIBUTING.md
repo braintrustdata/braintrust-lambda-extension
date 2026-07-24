@@ -39,7 +39,7 @@ Publish an archive with the AWS CLI:
 
 ```bash
 aws lambda publish-layer-version \
-  --layer-name braintrust-tracing-extension \
+  --layer-name braintrust-tracing-extension-arm64 \
   --zip-file fileb://dist/braintrust-lambda-layer-arm64.zip \
   --compatible-architectures arm64
 ```
