@@ -19,11 +19,12 @@ arn:aws:lambda:us-west-2:982534393296:layer:braintrust-tracing-extension:5
 Set these environment variables so the SDK flushes to the extension instead of the Braintrust data plane:
 
 ```text
-BRAINTRUST_API_KEY=<organization API key>
 BRAINTRUST_APP_URL=http://127.0.0.1:49891
 BRAINTRUST_API_URL=http://127.0.0.1:49891
 BRAINTRUST_PROJECT_ID=<project ID>
 ```
+
+Provide the API key to the SDK the way your application already does. The extension reads it from the SDK's requests, so it does not need to be set in the function configuration. Setting `BRAINTRUST_API_KEY` as a function environment variable also works, but is not recommended.
 
 Pass `project_id` directly to `init_logger()` when you can. If your code passes only a project name, set `BRAINTRUST_PROJECT_ID` so the extension can answer the SDK's project registration locally.
 
