@@ -1,0 +1,107 @@
+name: Publish Braintrust Lambda layers
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish public layer versions to the production AWS account."
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lambda-layer-publish
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish ${{ matrix.architecture }} layer
+    if: ${{ inputs.publish && github.ref == 'refs/heads/main' }}
+    needs: ci
+    runs-on: ${{ matrix.runner }}
+    environment: lambda-layer-publish
+    permissions:
+      contents: read
+      id-token: write # OIDC permissions for AWS auth
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: arm64
+            layer_name: braintrust-tracing-extension-arm64
+            runner: ubuntu-24.04-arm
+          - architecture: x86_64
+            layer_name: braintrust-tracing-extension
+            runner: ubuntu-24.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Build layer
+        env:
+          BRAINTRUST_LAMBDA_ARCHITECTURE: ${{ matrix.architecture }}
+          ZIP_PATH: dist/braintrust-lambda-layer-${{ matrix.architecture }}.zip
+        run: ./build-layer.sh "$ZIP_PATH"
+
+      - name: Verify layer archive
+        env:
+          ZIP_PATH: dist/braintrust-lambda-layer-${{ matrix.architecture }}.zip
+        run: |
+          set -euo pipefail
+          staging_dir="$(mktemp -d)"
+          unzip -q "$ZIP_PATH" -d "$staging_dir"
+          test -x "$staging_dir/extensions/braintrust-lambda-extension"
+          test "$(find "$staging_dir" -type f | wc -l)" -eq 1
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: arn:aws:iam::872608195481:role/github-lambda-layer-publish
+          aws-region: us-west-2
+          role-session-name: lambda-layer-publish-${{ github.run_id }}
+
+      - name: Publish public layer version
+        env:
+          ARCHITECTURE: ${{ matrix.architecture }}
+          LAYER_NAME: ${{ matrix.layer_name }}
+          ZIP_PATH: dist/braintrust-lambda-layer-${{ matrix.architecture }}.zip
+        run: |
+          set -euo pipefail
+          read -r layer_version_arn version_number <<< "$(aws lambda publish-layer-version \
+            --layer-name "$LAYER_NAME" \
+            --description "Braintrust Lambda tracing extension built from ${GITHUB_SHA}" \
+            --zip-file "fileb://${ZIP_PATH}" \
+            --compatible-architectures "$ARCHITECTURE" \
+            --query '[LayerVersionArn,Version]' \
+            --output text)"
+
+          aws lambda add-layer-version-permission \
+            --layer-name "$LAYER_NAME" \
+            --version-number "$version_number" \
+            --statement-id public-access \
+            --action lambda:GetLayerVersion \
+            --principal "*" \
+            >/dev/null
+
+          aws lambda get-layer-version-policy \
+            --layer-name "$LAYER_NAME" \
+            --version-number "$version_number" \
+            --query Policy \
+            --output text \
+            | jq -e '.Statement[] | select(.Sid == "public-access" and .Principal == "*" and .Action == "lambda:GetLayerVersion")' \
+            >/dev/null
+
+          {
+            echo "### ${ARCHITECTURE}"
+            echo
+            echo "\`${layer_version_arn}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

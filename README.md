@@ -11,7 +11,7 @@ Your function must already package the `braintrust` Python SDK and call `braintr
 Add the published layer ARN for your function's region and architecture. For example, for Python 3.12 `x86_64` in `us-west-2`:
 
 ```text
-arn:aws:lambda:us-west-2:982534393296:layer:braintrust-tracing-extension:5
+arn:aws:lambda:us-west-2:872608195481:layer:braintrust-tracing-extension:5
 ```
 
 ### 2. Point the SDK at the extension
@@ -39,7 +39,7 @@ Resources:
       Architectures:
         - x86_64
       Layers:
-        - arn:aws:lambda:us-west-2:982534393296:layer:braintrust-tracing-extension:5
+        - arn:aws:lambda:us-west-2:872608195481:layer:braintrust-tracing-extension:5
       Environment:
         Variables:
           BRAINTRUST_APP_URL: http://127.0.0.1:49891
@@ -51,7 +51,7 @@ Resources:
 resource "aws_lambda_function" "search" {
   architectures = ["x86_64"]
   layers = [
-    "arn:aws:lambda:us-west-2:982534393296:layer:braintrust-tracing-extension:5",
+    "arn:aws:lambda:us-west-2:872608195481:layer:braintrust-tracing-extension:5",
   ]
 
   environment {
