@@ -2,6 +2,9 @@
 name = "braintrust-lambda-extension"
 version = "0.1.0"
 edition = "2021"
+description = "AWS Lambda extension that proxies Braintrust SDK tracing off the handler's critical path."
+license = "Apache-2.0"
+repository = "https://github.com/braintrustdata/braintrust-lambda-extension"
 
 [dependencies]
 anyhow = "1"
