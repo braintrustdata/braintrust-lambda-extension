@@ -17,3 +17,11 @@ jobs:
       - run: cargo +1.95.0 clippy --all-targets --locked -- -D warnings
       - run: cargo +1.95.0 test --locked
       - run: cargo +1.95.0 build --release --locked
+
+  integration:
+    # SDK ↔ extension end-to-end tests (Docker). Same command as `integration/run.sh`
+    # locally. Runs the supported SDKs (python, typescript); OTLP SDKs report SKIP.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: ./integration/run.sh

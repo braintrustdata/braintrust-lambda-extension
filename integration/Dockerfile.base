@@ -1,0 +1,17 @@
+# syntax=docker/dockerfile:1
+# Base image for the integration tests: the REAL extension binary + the shared harness.
+# Per-SDK app images build FROM this and add only their toolchain + SDK + app.
+# Build from the repo root:  docker build -f integration/Dockerfile.base -t bt-ext-base .
+
+FROM rust:1.95.0-alpine3.22 AS build
+RUN apk add --no-cache musl-dev
+WORKDIR /src
+COPY extension/Cargo.toml extension/Cargo.lock ./
+COPY extension/src ./src
+RUN cargo build --locked --release
+
+FROM python:3.12-slim
+COPY --from=build /src/target/release/braintrust-lambda-extension /usr/local/bin/braintrust-lambda-extension
+COPY integration/harness /harness
+ENV EXTENSION_BIN=/usr/local/bin/braintrust-lambda-extension
+ENTRYPOINT ["python3", "/harness/run.py"]
