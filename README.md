@@ -6,12 +6,12 @@ The Lambda extension is a native HTTP proxy for the Braintrust SDK running in AW
 
 | SDK             | Package             | Versions    |
 | --------------- | ------------------- | ----------- |
-| Python          | `braintrust` (PyPI) | >= `0.27.0` |
-| TypeScript / JS | `braintrust` (npm)  | >= `3.0.0`  |
+| [Python](https://github.com/braintrustdata/braintrust-sdk-python)          | `braintrust` (PyPI) | >= `0.27.0` |
+| [TypeScript / JS](https://github.com/braintrustdata/braintrust-sdk-javascript) | `braintrust` (npm)  | >= `3.0.0`  |
 
 _NOTE: This extension covers project-log tracing only. Prompt loading, datasets, attachments, experiment logging, and other Braintrust API calls are not proxied._
 
-_NOTE: OTLP-based SDKs (Ruby, Go, Java .NET) are not supported at this time._
+_NOTE: Braintrust's OTLP-based SDKs ([Ruby](https://github.com/braintrustdata/braintrust-sdk-ruby), [Go](https://github.com/braintrustdata/braintrust-sdk-go), [Java](https://github.com/braintrustdata/braintrust-sdk-java), and [.NET](https://github.com/braintrustdata/braintrust-sdk-dotnet)) are not supported at this time._
 
 ## Setup
 
