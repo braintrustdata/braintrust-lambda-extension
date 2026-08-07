@@ -148,7 +148,7 @@ def main():
         masked = f"{api_key[:20]}…"  # constant prefix + part of the per-run unique suffix
         print(
             f"PASS {sdk}  invoke={invoke_ms:.0f}ms  sink={sink_ms:.0f}ms  "
-            f"key={masked} (captured from SDK bearer, forwarded upstream on login + /logs3)",
+            f"key={masked} (from SDK Bearer)",
             flush=True,
         )
         return 0
