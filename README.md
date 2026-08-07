@@ -1,10 +1,21 @@
 # Braintrust Lambda Extension
 
-This Lambda extension supports the Braintrust SDK, improving its performance in AWS Lambda handlers. It acts as a proxy that offloads egress from the handler process.
+The Lambda extension is a native HTTP proxy for the Braintrust SDK running in AWS Lambda handlers. It helps improve latency by offloading blocking logging operations.
+
+## Compatibility
+
+| SDK             | Package             | Versions    |
+| --------------- | ------------------- | ----------- |
+| [Python](https://github.com/braintrustdata/braintrust-sdk-python)          | `braintrust` (PyPI) | >= `0.27.0` |
+| [TypeScript / JS](https://github.com/braintrustdata/braintrust-sdk-javascript) | `braintrust` (npm)  | >= `3.0.0`  |
+
+_NOTE: This extension covers project-log tracing only. Prompt loading, datasets, attachments, experiment logging, and other Braintrust API calls are not proxied._
+
+_NOTE: Braintrust's OTLP-based SDKs ([Ruby](https://github.com/braintrustdata/braintrust-sdk-ruby), [Go](https://github.com/braintrustdata/braintrust-sdk-go), [Java](https://github.com/braintrustdata/braintrust-sdk-java), and [.NET](https://github.com/braintrustdata/braintrust-sdk-dotnet)) are not supported at this time._
 
 ## Setup
 
-Your function must already package the `braintrust` Python SDK and call `braintrust.flush()` at the end of the handler.
+Your function must already package a supported Braintrust SDK and flush at the end of the handler.
 
 ### 1. Attach the layer
 
@@ -34,7 +45,7 @@ BRAINTRUST_PROJECT_ID=<project ID>
 
 Provide the API key to the SDK the way your application already does. The extension reads it from the SDK's requests, so it does not need to be set in the function configuration. Setting `BRAINTRUST_API_KEY` as a function environment variable also works, but is not recommended.
 
-Pass `project_id` directly to `init_logger()` when you can. If your code passes only a project name, set `BRAINTRUST_PROJECT_ID` so the extension can answer the SDK's project registration locally.
+Set `project_id` when configuring the logger (alternatively `BRAINTRUST_PROJECT_ID`) so the extension can answer the SDK's project registration locally.
 
 The same configuration through infrastructure-as-code:
 
@@ -71,9 +82,12 @@ resource "aws_lambda_function" "search" {
 }
 ```
 
-### 3. Keep the handler's flush()
+### 3. Flush at the end of the handler
+
+With the layer attached, the SDK's flush waits for a local handoff rather than remote delivery. Keep the flush your handler already performs.
 
 ```python
+# Python
 import braintrust
 
 logger = braintrust.init_logger(project_id="<project ID>")
@@ -88,9 +102,26 @@ def handler(event, context):
         braintrust.flush()
 ```
 
-With the layer attached, `flush()` waits for a local handoff rather than remote delivery.
+```typescript
+// TypeScript / JavaScript
+import { initLogger, flush } from "braintrust";
 
-> **Links:** Python SDK 0.27.x builds `Span.link()` and `Span.permalink()` from `BRAINTRUST_APP_URL`, so they return a localhost URL with this configuration. Generate a shareable link with `braintrust.permalink(span.export(), app_url="https://www.braintrust.dev")`.
+const logger = initLogger({ projectId: "<project ID>" });
+
+export async function handler(event: unknown) {
+  return await logger
+    .traced(
+      async (span) => {
+        span.log({ input: event });
+        return { statusCode: 200 };
+      },
+      { name: "request" },
+    )
+    .finally(() => flush());
+}
+```
+
+_NOTE: When using the extension, permalinks may reflect `localhost` instead of `braintrust.dev`. You can generate a shareable link against the real app URL with the SDK's permalink helper (e.g. in Python: `braintrust.permalink(span.export(), app_url="https://www.braintrust.dev")`.)_
 
 ## Configuration
 
@@ -105,18 +136,5 @@ With the layer attached, `flush()` waits for a local handoff rather than remote 
 | `BRAINTRUST_LAMBDA_FSYNC`                        | `1`                                | Fsync a payload before acknowledging localhost |
 | `BRAINTRUST_LAMBDA_DISABLE_SDK_OVERFLOW`         | `1`                                | Keep SDK payloads on the local `/logs3` path   |
 
-The SDK's asynchronous publisher can remain enabled; the explicit `braintrust.flush()` is the barrier that ensures all rows reach the extension before Lambda freezes the runtime.
-
-For strict tail latency, set `BRAINTRUST_SYNC_FLUSH=1` so the flush performs one consolidated local handoff without the background publisher, and `BRAINTRUST_NUM_RETRIES=0` to skip the SDK's retry backoff — the extension owns retries once it has accepted a payload.
-
-By default the local `/version` response does not advertise `logs3_payload_max_bytes`, which keeps SDK 0.27.x from routing oversized rows through `/logs3/overflow` (not implemented). Set `BRAINTRUST_LAMBDA_DISABLE_SDK_OVERFLOW=0` to restore payload-limit advertisement.
-
-The extension performs the API-key login against `https://www.braintrust.dev`. Set `BRAINTRUST_LAMBDA_UPSTREAM_APP_URL` for a different control plane, and `BRAINTRUST_ORG_NAME` when an API key belongs to more than one organization.
-
-## Delivery semantics
-
-A `/logs3` response means the payload has been written to the execution environment's `/tmp` storage; the extension retries failed upstream requests during the current or a later warm invocation. This protects delivery across normal Lambda freezes and runtime resets. It does not guarantee delivery if AWS permanently destroys the execution environment before the upstream request succeeds, because `/tmp` is scoped to that environment.
-
-The extension sends upstream concurrently with the handler when possible and continues after `platform.runtimeDone` for the configured post-runtime budget. This removes the remote round trip from response latency, though post-runtime work can still appear in Lambda duration and billing metrics.
-
-The extension proxies project-log tracing through `init_logger()`. Prompt loading, datasets, attachments, experiment logging, and other Braintrust API calls are not proxied.
+- For strict tail latency, set `BRAINTRUST_SYNC_FLUSH=1` so the flush performs one consolidated local handoff without the background publisher, and `BRAINTRUST_NUM_RETRIES=0` to skip the SDK's retry backoff.
+- The extension performs the API-key login against `https://www.braintrust.dev`. Set `BRAINTRUST_LAMBDA_UPSTREAM_APP_URL` for a different control plane, and `BRAINTRUST_ORG_NAME` when an API key belongs to more than one organization.

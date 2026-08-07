@@ -8,7 +8,7 @@ The layer is a self-contained external Lambda extension that:
 - Serves the Braintrust login, project metadata, `/version`, and `/logs3` endpoints on localhost, so the SDK talks to it instead of the Braintrust data plane.
 - Spools accepted `/logs3` payloads to `/tmp`, forwards them to Braintrust, and retries across runtime freezes and warm invocations.
 
-It does not import, patch, or package the Braintrust SDK; it operates at the SDK's HTTP boundary, matching the Braintrust Python SDK 0.27.x.
+It does not import, patch, or package the Braintrust SDK; it operates at the SDK's HTTP boundary, emulating the Braintrust data-plane protocol (`api_version 2`). It is validated end-to-end against the Braintrust Python SDK (`0.27.0`+); other SDKs that speak the same protocol (e.g. the Node/TypeScript SDK) are expected to work. See the compatibility table in the README.
 
 ### Authentication and sessions
 
