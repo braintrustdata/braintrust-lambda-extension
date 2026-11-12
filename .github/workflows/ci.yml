@@ -17,3 +17,50 @@ jobs:
       - run: cargo +1.95.0 clippy --all-targets --locked -- -D warnings
       - run: cargo +1.95.0 test --locked
       - run: cargo +1.95.0 build --release --locked
+
+  # Build the extension binary once (static musl, from the shipping Dockerfile). The Rust
+  # build is layer-cached and only recompiles when the extension source changes, so the
+  # extension dev cycle is fast. The binary is shared with the integration jobs as an
+  # artifact — it's mounted into the app containers, decoupled from the SDK images.
+  extension-binary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build extension binary
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: extension
+          file: extension/Dockerfile
+          outputs: type=local,dest=bin
+          cache-from: type=gha,scope=extension
+          cache-to: type=gha,mode=max,scope=extension
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: extension-binary
+          path: bin/braintrust-lambda-extension
+          if-no-files-found: error
+
+  # One job per SDK so each result is visible independently (fail-fast: false shows all).
+  # The extension binary comes from the artifact above; the SDK app image is layer-cached
+  # and only rebuilds when the published SDK version changes (SDK_VERSION busts the cache).
+  integration:
+    needs: extension-binary
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk: [python, typescript]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: extension-binary
+          path: integration/.bin
+      - run: chmod +x integration/.bin/braintrust-lambda-extension
+      - name: Run ${{ matrix.sdk }} integration test
+        env:
+          GHA_CACHE: "1"
+          EXTENSION_BIN_PREBUILT: "1" # binary comes from the artifact above
+        run: ./integration/run.sh ${{ matrix.sdk }}
